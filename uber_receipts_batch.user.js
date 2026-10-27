@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber 收据批量下载（按日期范围 / PDF）
 // @namespace    https://github.com/BEDUSER/uber-receipts-downloader
-// @version      1.1.0
+// @version      1.2.0
 // @description  在 riders.uber.com/trips 注入面板，按日期范围一键批量下载行程收据 PDF（Invoice 优先，Receipt 兜底）。带随机真人延迟、分批暂停、失败重试、风控自动停、进度与结果 CSV。纯读取，不修改账户任何数据。
 // @author       BEDUSER
 // @license      MIT
@@ -74,8 +74,10 @@
     maxTripCount: 0,           // 0 = 不限制；调试时可设 10
 
     // —— 下载方式 ——
-    useGM_download: true,      // true=GM_download(blob) 优先，失败自动回退 <a download>
-    saveAs: false,             // 是否每笔都弹「另存为」
+    useFolder: true,           // true=直接写入你指定的文件夹（File System Access API），无需任何确认
+    skipExistingInFolder: true,// 目标文件夹里已有同名文件就跳过，不重复下载
+    useGM_download: true,      // 未指定文件夹时：GM_download(blob) 优先，失败回退 <a download>
+    saveAs: false,             // 是否每笔都弹「另存为」（仅影响 GM_download 路径）
 
     // —— 数据来源 ——
     apiFirst: true,            // 优先用 GraphQL（快、准、天然支持时间过滤）；失败回退 DOM 滚动
@@ -217,6 +219,8 @@
     running: false,
     stopRequested: false,
     results: [],        // { uuid, label, date, kind, filename, status, message }
+    dirHandle: null,    // 用户选定的文件夹（IndexedDB 持久化）
+    dir: null,          // 本次运行已确认可写的文件夹
   };
 
   const ui = {};
@@ -262,6 +266,9 @@
   #${PANEL_ID} .log .ok{color:#5fd08a}
   #${PANEL_ID} .log .warn{color:#f0c05a}
   #${PANEL_ID} .tip{margin-top:8px;font-size:11px;color:#6d6d6d;line-height:1.5}
+  #${PANEL_ID} .dirhint{margin:-2px 0 9px 60px;font-size:11px;color:#8a8a8a;line-height:1.45}
+  #${PANEL_ID} .dirhint.on{color:#5fd08a}
+  #${PANEL_ID} .dirhint b{color:#e2e2e2;font-weight:600}
   #${PANEL_ID} .hint{color:#f0c05a}
   `;
 
@@ -295,6 +302,11 @@
           <button type="button" class="ghost" data-act="preview">预览</button>
           <button type="button" class="primary" data-act="run">批量下载</button>
         </div>
+        <div class="row" style="margin-top:9px">
+          <label>保存到</label>
+          <button type="button" class="ghost" data-act="pickdir" style="flex:1">选择文件夹…</button>
+        </div>
+        <div class="dirhint" data-role="dirhint">未选择：将保存到浏览器默认下载目录</div>
         <div class="actions" style="margin-top:8px">
           <button type="button" class="ghost" data-act="retry">重试失败项</button>
           <button type="button" class="ghost" data-act="csv">导出结果CSV</button>
@@ -302,9 +314,9 @@
         <div class="progress" data-role="progress">就绪。选好日期后先点「预览」。</div>
         <div class="bar"><i data-role="bar"></i></div>
         <div class="log" data-role="log"></div>
-        <div class="tip">串行下载，每次间隔 3~5 秒，每 10 笔长休息。<br>
-        首次会提示「允许下载多个文件」，请选择允许。<br>
-        请保持本标签页在前台，不要关页面。</div>
+        <div class="tip">建议先点「选择文件夹」，之后直接写入、全程无弹窗。<br>
+        未选择时保存到浏览器默认下载目录，首次需允许「下载多个文件」。<br>
+        串行下载，每次间隔 3~5 秒。请保持本标签页在前台。</div>
       </div>`;
     host.appendChild(panel);
 
@@ -318,6 +330,8 @@
     ui.btnPreview = panel.querySelector('[data-act="preview"]');
     ui.btnRetry = panel.querySelector('[data-act="retry"]');
     ui.btnCsv = panel.querySelector('[data-act="csv"]');
+    ui.btnPickDir = panel.querySelector('[data-act="pickdir"]');
+    ui.dirHint = panel.querySelector('[data-role="dirhint"]');
     ui.btnStop = null;
 
     // 默认区间：最近 90 天
@@ -327,6 +341,7 @@
     ui.end.value = fmtDate(today);
 
     panel.addEventListener('click', onPanelClick);
+    restoreDirHandle();
     return true;
   }
 
@@ -360,6 +375,10 @@
     }
     if (btn.dataset.act === 'csv') {
       exportCsv();
+      return;
+    }
+    if (btn.dataset.act === 'pickdir') {
+      pickDirectory();
       return;
     }
     if (btn.dataset.act === 'stop') {
@@ -869,6 +888,155 @@
   /* =========================================================
    * 8. 下载
    * =======================================================*/
+  /* ---- 8.0 指定文件夹（File System Access API）----
+   * 网页无法自己创建目录，但可以「让用户选一次目录、之后静默写入」：
+   * 目录句柄存在 IndexedDB 里，下次打开页面自动复用。
+   * 这样既不出现下载栏，也不会再弹「允许下载多个文件」。            */
+  const IDB_NAME = 'uber-rc-fs';
+  const IDB_STORE = 'handles';
+  const IDB_KEY = 'dir';
+
+  function idbOpen() {
+    return new Promise((resolve, reject) => {
+      let req;
+      try {
+        req = indexedDB.open(IDB_NAME, 1);
+      } catch (e) {
+        return reject(e);
+      }
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function idbSetDir(handle) {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).put(handle, IDB_KEY);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async function idbGetDir() {
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).get(IDB_KEY);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function idbClearDir() {
+    const db = await idbOpen();
+    return new Promise((resolve) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).delete(IDB_KEY);
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => resolve(false);
+    });
+  }
+
+  function updateDirHint() {
+    if (!ui.dirHint) return;
+    const h = state.dirHandle;
+    if (h) {
+      ui.dirHint.className = 'dirhint on';
+      ui.dirHint.innerHTML = `已选择：<b></b>（写入时不再有任何确认弹窗）`;
+      ui.dirHint.querySelector('b').textContent = h.name;
+    } else {
+      ui.dirHint.className = 'dirhint';
+      ui.dirHint.textContent = '未选择：将保存到浏览器默认下载目录';
+    }
+  }
+
+  async function restoreDirHandle() {
+    if (!CFG.useFolder) return;
+    try {
+      const h = await idbGetDir();
+      if (h) {
+        state.dirHandle = h;
+        updateDirHint();
+      }
+    } catch (_) { /* 索引库不可用（无痕模式等），忽略 */ }
+  }
+
+  async function pickDirectory() {
+    const picker = (typeof unsafeWindow !== 'undefined' && unsafeWindow && unsafeWindow.showDirectoryPicker)
+      ? unsafeWindow.showDirectoryPicker.bind(unsafeWindow)
+      : (typeof window.showDirectoryPicker === 'function' ? window.showDirectoryPicker.bind(window) : null);
+
+    if (!picker) {
+      setProgress('当前浏览器不支持选择文件夹（需要 Chrome / Edge 86+）。\n将改为保存到浏览器默认下载目录。');
+      return;
+    }
+
+    try {
+      const handle = await picker({ id: 'uber-receipts', mode: 'readwrite' });
+      state.dirHandle = handle;
+      try {
+        await idbSetDir(handle);
+      } catch (_) { logLine('目录句柄无法保存（无痕模式？），下次需重新选择', 'warn'); }
+      updateDirHint();
+      logLine(`保存位置已设为：${handle.name}`, 'ok');
+      setProgress(`以后收据会直接写入：${handle.name}\n不再有任何确认弹窗。`);
+    } catch (e) {
+      if (e && (e.name === 'AbortError' || e.name === 'NotAllowedError')) return; // 用户取消
+      logLine(`选择文件夹失败：${e.message}`, 'err');
+    }
+  }
+
+  // 确保有可写权限；拿不到就返回 null（自动降级到默认下载目录）
+  async function ensureDirWritable() {
+    if (!CFG.useFolder) return null;
+    if (!state.dirHandle) {
+      try {
+        state.dirHandle = await idbGetDir();
+      } catch (_) { state.dirHandle = null; }
+    }
+    const h = state.dirHandle;
+    if (!h) return null;
+
+    const opts = { mode: 'readwrite' };
+    try {
+      if ((await h.queryPermission(opts)) === 'granted') return h;
+      // requestPermission 需要用户手势：这里通常在点「批量下载」的同一次点击链里
+      if ((await h.requestPermission(opts)) === 'granted') {
+        updateDirHint();
+        return h;
+      }
+      logLine('文件夹权限被拒绝，本次改为保存到默认下载目录', 'warn');
+    } catch (e) {
+      logLine(`文件夹权限检查失败（${e.message}），改为默认下载目录`, 'warn');
+    }
+    return null;
+  }
+
+  async function fileExistsInDir(dir, filename) {
+    try {
+      await dir.getFileHandle(filename);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  async function writeToDir(dir, blob, filename) {
+    const fh = await dir.getFileHandle(filename, { create: true });
+    const w = await fh.createWritable();
+    try {
+      await w.write(blob);
+    } finally {
+      await w.close();
+    }
+  }
+
   function isCrossOrigin(url) {
     try {
       return new URL(url, location.href).origin !== location.origin;
@@ -979,6 +1147,22 @@
   }
 
   async function saveBlob(blob, filename) {
+    // ① 首选：直接写入用户指定文件夹（无任何确认弹窗）
+    if (CFG.useFolder && state.dirHandle) {
+      const dir = state.dir;
+      if (dir) {
+        try {
+          if (CFG.skipExistingInFolder && await fileExistsInDir(dir, filename)) {
+            return '已存在·跳过';
+          }
+          await writeToDir(dir, blob, filename);
+          return '文件夹';
+        } catch (e) {
+          logLine(`写入文件夹失败（${e.message}），回退默认下载目录`, 'warn');
+        }
+      }
+    }
+
     if (CFG.useGM_download) {
       try {
         await gmSave(blob, filename);
@@ -1077,6 +1261,12 @@
     setRunning(true, mode === 'download');
     setBar(0, 0);
     logLine(`范围：${startVal} ~ ${endVal}`);
+
+    // 下载前先确认文件夹可写（requestPermission 需要用户手势，此时仍在点击链内）
+    if (mode === 'download') {
+      state.dir = await ensureDirWritable();
+      if (state.dir) logLine(`保存到文件夹：${state.dir.name}`, 'ok');
+    }
 
     try {
       // —— 收集行程 ——
@@ -1188,10 +1378,12 @@
 
       setBar(total, total);
       const failedList = state.results.filter((r) => r.status === 'fail');
+      const skippedExisting = state.results.filter((r) => /已存在/.test(r.message)).length;
       setProgress(
         `完成：成功 ${okCount} 笔，失败 ${failCount} 笔。\n` +
-        (failedList.length ? '失败项可点「重试失败项」。\n' : '') +
-        '下载文件在浏览器默认下载目录。'
+        (skippedExisting ? `其中 ${skippedExisting} 笔因文件已存在而跳过。\n` : '') +
+        (state.dir ? `文件已写入：${state.dir.name}\n` : '下载文件在浏览器默认下载目录。') +
+        (failedList.length ? '失败项可点「重试失败项」。' : '')
       );
       logLine(`结束：成功 ${okCount} / 失败 ${failCount}`, okCount ? 'ok' : 'warn');
     } catch (e) {
@@ -1285,7 +1477,7 @@
     }
     if (document.getElementById(PANEL_ID)) return;
     try {
-      if (mountPanel()) console.info('[UberRC] 面板已注入 v1.1.0');
+      if (mountPanel()) console.info('[UberRC] 面板已注入 v1.2.0');
     } catch (e) {
       console.error('[UberRC] 面板注入失败', e);
     }
@@ -1294,10 +1486,10 @@
   // 自检入口：TM 菜单 →「检查脚本是否运行」不通时，可在控制台输入 __uberRC.diag()
   function exposeDebugApi() {
     const api = {
-      version: '1.1.0',
+      version: '1.2.0',
       diag() {
         return {
-          version: '1.1.0',
+          version: '1.2.0',
           url: location.href,
           pathname: location.pathname,
           isTripsPage: isTripsPage(),
