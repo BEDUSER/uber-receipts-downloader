@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         Uber 收据批量下载（按日期范围 / PDF）
 // @namespace    https://github.com/BEDUSER/uber-receipts-downloader
-// @version      1.0.3
+// @version      1.0.4
 // @description  在 riders.uber.com/trips 注入面板，按日期范围一键批量下载行程收据 PDF（Invoice 优先，Receipt 兜底）。带随机真人延迟、分批暂停、失败重试、风控自动停、进度与结果 CSV。纯读取，不修改账户任何数据。
 // @author       BEDUSER
 // @license      MIT
-// @downloadURL  https://gist.githubusercontent.com/BEDUSER/aad00af583ffef6911f1ceaca7bb2c42/raw/uber_receipts_batch.user.js
-// @updateURL    https://gist.githubusercontent.com/BEDUSER/aad00af583ffef6911f1ceaca7bb2c42/raw/uber_receipts_batch.user.js
+// @homepageURL  https://github.com/BEDUSER/uber-receipts-downloader
+// @supportURL   https://github.com/BEDUSER/uber-receipts-downloader/issues
+// @downloadURL  https://raw.githubusercontent.com/BEDUSER/uber-receipts-downloader/main/uber_receipts_batch.user.js
+// @updateURL    https://raw.githubusercontent.com/BEDUSER/uber-receipts-downloader/main/uber_receipts_batch.user.js
 // @match        https://riders.uber.com/*
 // @grant        GM_download
 // @grant        GM_xmlhttpRequest
@@ -37,15 +39,15 @@
  *   - pickReceiptTrigger : 行程卡片上「查看收据」入口的识别
  *   - detectPdfAnchor()  : 收据弹窗里「下载 PDF」链接的识别
  * ============================================================
- *  分享 / 发布（源码不公开）
+ *  分享 / 发布
  * ============================================================
- * GitHub 仓库 BEDUSER/uber-receipts-downloader 已设为 Private，只作为源码历史；
- * 对外只发一条「秘密 Gist」安装链接（不出现在 gist 列表、无法被搜索到）：
+ * 源码仓库（Public）：https://github.com/BEDUSER/uber-receipts-downloader
  *
- *   https://gist.githubusercontent.com/BEDUSER/aad00af583ffef6911f1ceaca7bb2c42/raw/uber_receipts_batch.user.js
+ * 安装链接（发给别人就用这条）：
+ *   https://raw.githubusercontent.com/BEDUSER/uber-receipts-downloader/main/uber_receipts_batch.user.js
  *
- * 发版流程：改本文件 → 把 @version 加一位 → 运行同目录的 publish.ps1（会推送仓库并同步 Gist）。
- * 注意：安装者依旧能在 Tampermonkey 里看到全文，用户脚本无法对使用者保密。
+ * 发版流程：改本文件 → @version 加一位 → 运行同目录 publish.ps1（提交并推送）。
+ * 已安装的用户会在 24 小时内自动更新。
  * ============================================================
  */
 
@@ -1160,7 +1162,7 @@
     }
     if (document.getElementById(PANEL_ID)) return;
     try {
-      if (mountPanel()) console.info('[UberRC] 面板已注入 v1.0.3');
+      if (mountPanel()) console.info('[UberRC] 面板已注入 v1.0.4');
     } catch (e) {
       console.error('[UberRC] 面板注入失败', e);
     }
@@ -1169,7 +1171,7 @@
   // 自检入口：TM 菜单 →「检查脚本是否运行」不通时，可在控制台输入 __uberRC.diag()
   function exposeDebugApi() {
     const api = {
-      version: '1.0.3',
+      version: '1.0.4',
       diag() {
         return {
           url: location.href,

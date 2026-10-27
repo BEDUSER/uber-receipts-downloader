@@ -1,23 +1,20 @@
 ﻿<#
   一键发布 Uber 收据下载脚本
   ------------------------------------------------
-  做两件事：
-    1) 把本目录的改动提交并推送到【私有】源码仓库
-    2) 同步到【秘密 Gist】—— 即对外唯一的安装源
+  提交并推送到 https://github.com/BEDUSER/uber-receipts-downloader
+  安装源就是仓库的 raw 地址，推送后即生效；已安装的用户 24 小时内自动更新。
 
-  用法（本机执行策略默认禁止跑脚本，用下面这行）：
+  用法（本机默认禁止运行脚本，必须带 Bypass）：
     powershell -NoProfile -ExecutionPolicy Bypass -File .\publish.ps1
     powershell -NoProfile -ExecutionPolicy Bypass -File .\publish.ps1 "修复 xxx"
 
-  GitHub Token 从 Windows 凭据管理器现取（git credential fill），
-  不写入任何文件、不打印到屏幕。
+  GitHub 凭据取自 Windows 凭据管理器，不写文件、不打印。
 #>
 param([string]$Message = "")
 
 $ErrorActionPreference = "Stop"
-
-$GistId = "aad00af583ffef6911f1ceaca7bb2c42"
-$File   = Join-Path $PSScriptRoot "uber_receipts_batch.user.js"
+$File = Join-Path $PSScriptRoot "uber_receipts_batch.user.js"
+$InstallUrl = "https://raw.githubusercontent.com/BEDUSER/uber-receipts-downloader/main/uber_receipts_batch.user.js"
 
 # git 会把正常进度写到 stderr，别让它被当成致命错误
 function Invoke-Git {
@@ -41,10 +38,6 @@ if (-not $Message) { $Message = "chore: release v$version" }
 
 Push-Location $PSScriptRoot
 try {
-  $cred = ("protocol=https`nhost=github.com`n`n" | git credential fill) 2>$null
-  $tok = (($cred | Select-String '^password=') -replace '^password=','').ToString().Trim()
-  if (-not $tok) { throw "未找到 GitHub 凭据，请先手动 git push 一次完成登录" }
-
   Invoke-Git @("add", "-A") | Out-Null
   $code = Invoke-Git @("diff", "--cached", "--quiet")
   if ($code -eq 0) {
@@ -57,22 +50,8 @@ try {
     $pushCode = Invoke-Git @("push")
     if ($pushCode -ne 0) { throw "git push 失败（exit $pushCode）" }
   }
-
-  $h = @{
-    Authorization = "Bearer $tok"
-    Accept        = "application/vnd.github+json"
-    "User-Agent"  = "codex-agent"
-  }
-  $body = @{
-    description = "Uber 收据批量下载（安装源 v$version）"
-    files       = @{ "uber_receipts_batch.user.js" = @{ content = $content } }
-  } | ConvertTo-Json -Depth 6 -Compress
-  $bytes = [System.Text.Encoding]::UTF8.GetBytes($body)
-  Invoke-WebRequest -Uri "https://api.github.com/gists/$GistId" -Method PATCH -Headers $h `
-    -Body $bytes -ContentType "application/json; charset=utf-8" -UseBasicParsing -TimeoutSec 60 | Out-Null
-
   Write-Host ""
   Write-Host "已发布 v$version" -ForegroundColor Green
-  Write-Host "安装链接：https://gist.githubusercontent.com/BEDUSER/$GistId/raw/uber_receipts_batch.user.js"
+  Write-Host "安装链接：$InstallUrl"
 }
 finally { Pop-Location }
