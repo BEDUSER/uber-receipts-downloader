@@ -5,22 +5,23 @@
 
 ## 安装
 
+📖 **完整图文步骤见 [INSTALL.md](./INSTALL.md)**（含权限设置、三种安装方式、常见问题）
+
+简版：
+
 1. 先装 [Tampermonkey](https://www.tampermonkey.net/)（Chrome / Edge）。
-2. Chrome 地址栏打开 `chrome://extensions`，右上角打开 **开发者模式**（Chrome 127+ 必须，否则用户脚本不执行）。
-3. 点下面的链接 → Tampermonkey 会弹出安装页 → 点「安装」：
+2. 打开 `chrome://extensions` → 右上角开「**开发者模式**」→ Tampermonkey「详情」→
+   开「**允许用户脚本**」，并把「**网站访问权限**」设为「**在所有网站上**」。
+3. 点下面的链接 → Tampermonkey 弹出安装页 → 点「安装」：
 
    **https://raw.githubusercontent.com/BEDUSER/uber-receipts-downloader/main/uber_receipts_batch.user.js**
 
 4. 打开 https://riders.uber.com/trips ，页面右上角出现面板即安装成功。
 
-> 若点开链接只出现 Tampermonkey 的「Script Installation」中间页（没有安装按钮），
-> 说明 Chrome 的用户脚本权限没开：`chrome://extensions` → 打开「开发者模式」→
-> Tampermonkey「详情」→ 打开「允许用户脚本」，再重试链接。
->
-> 实在装不上时可直接用编辑器安装：TM 管理面板 →「已安装脚本」→「+」→ 粘贴
-> `uber_receipts_batch.user.js` 全文 → Ctrl+S。
->
-> 发版：改脚本 → `@version` 加一位 → 运行 `.\publish.ps1`（提交并推送，安装者 24h 内自动更新）。
+> 若点开链接只出现「Script Installation」空页面，说明第 2 步的权限没开全，
+> 或改用 [INSTALL.md](./INSTALL.md) 里的「拖文件进 TM 面板」方式。
+
+发版：改脚本 → `@version` 加一位 → 运行 `.\publish.ps1`（提交并推送，安装者 24h 内自动更新）。
 
 ## 使用
 
