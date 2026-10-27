@@ -9,9 +9,15 @@
 2. Chrome 地址栏打开 `chrome://extensions`，右上角打开 **开发者模式**（Chrome 127+ 必须，否则用户脚本不执行）。
 3. 点下面的链接 → Tampermonkey 会弹出安装页 → 点「安装」：
 
-   **https://raw.githubusercontent.com/BEDUSER/uber-receipts-downloader/main/uber_receipts_batch.user.js**
+   **https://gist.githubusercontent.com/BEDUSER/aad00af583ffef6911f1ceaca7bb2c42/raw/uber_receipts_batch.user.js**
 
 4. 打开 https://riders.uber.com/trips ，页面右上角出现面板即安装成功。
+
+> 本仓库为**私有**源码仓，只作版本历史；对外分发使用上面这条秘密 Gist 安装链接
+> （不出现在 gist 列表、无法被搜索到）。注意：安装者仍可在 Tampermonkey 里看到脚本全文，
+> 用户脚本无法对使用者保密。
+>
+> 发版：改脚本 → `@version` 加一位 → 运行 `.\publish.ps1`（推送仓库并同步 Gist）。
 
 ## 使用
 
