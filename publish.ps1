@@ -38,6 +38,12 @@ if (-not $Message) { $Message = "chore: release v$version" }
 
 Push-Location $PSScriptRoot
 try {
+  # 本机沙箱环境里 schannel 走代理会握手失败，统一用 openssl 后端 + 显式代理
+  $proxy = $env:HTTPS_PROXY
+  if (-not $proxy) { $proxy = $env:HTTP_PROXY }
+  $tlsArgs = @("-c", "http.sslBackend=openssl")
+  if ($proxy) { $tlsArgs += @("-c", "http.proxy=$proxy") }
+
   Invoke-Git @("add", "-A") | Out-Null
   $code = Invoke-Git @("diff", "--cached", "--quiet")
   if ($code -eq 0) {
@@ -47,7 +53,7 @@ try {
     $tmp = Join-Path $env:TEMP "uber_rc_publish_msg.txt"
     [System.IO.File]::WriteAllText($tmp, $msg, (New-Object System.Text.UTF8Encoding($false)))
     Invoke-Git @("commit", "-F", $tmp) | Out-Null
-    $pushCode = Invoke-Git @("push")
+    $pushCode = Invoke-Git (@("push") + $tlsArgs)
     if ($pushCode -ne 0) { throw "git push 失败（exit $pushCode）" }
   }
   Write-Host ""
