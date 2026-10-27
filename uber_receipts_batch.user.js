@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Uber 收据批量下载（按日期范围 / PDF）
 // @namespace    https://github.com/BEDUSER/uber-receipts-downloader
-// @version      1.0.4
+// @version      1.1.0
 // @description  在 riders.uber.com/trips 注入面板，按日期范围一键批量下载行程收据 PDF（Invoice 优先，Receipt 兜底）。带随机真人延迟、分批暂停、失败重试、风控自动停、进度与结果 CSV。纯读取，不修改账户任何数据。
 // @author       BEDUSER
 // @license      MIT
@@ -145,6 +145,9 @@
 
   class RiskError extends Error {}   // 429 / 403 / 402：疑似风控
   class StopError extends Error {}   // 用户点了停止
+
+  // 页面自己发给 /graphql 的 Activities 请求（用于我方查询失效时复用）
+  const learned = { activities: null, receiptOps: [] };
 
   function debug(...args) {
     if (CFG.debug) console.log('[UberRC]', ...args);
@@ -422,8 +425,8 @@
   /* =========================================================
    * 5. 数据源 A：GraphQL（首选）
    * =======================================================*/
-  async function gql(name, variables) {
-    const op = GQL[name];
+  async function gql(name, variables, override) {
+    const op = override || GQL[name];
     if (!op) throw new Error(`未知查询 ${name}`);
     const resp = await fetch('/graphql', {
       method: 'POST',
@@ -432,7 +435,11 @@
         'x-csrf-token': 'x',
       },
       credentials: 'include',
-      body: JSON.stringify({ operationName: name, variables, query: op.document }),
+      body: JSON.stringify({
+        operationName: (override && override.operationName) || name,
+        variables,
+        query: op.document || op.query,
+      }),
     });
 
     if (resp.status === 429 || resp.status === 403 || resp.status === 402) {
@@ -441,19 +448,58 @@
     if (resp.status === 401) {
       throw new RiskError('未登录（401），请先登录 Uber 再运行');
     }
-    if (!resp.ok) throw new Error(`GraphQL HTTP ${resp.status}`);
+    if (!resp.ok) {
+      // 把服务端返回的错误正文带出来，方便定位是哪个字段过期了
+      let body = '';
+      try {
+        body = (await resp.text()).replace(/\s+/g, ' ').slice(0, 200);
+      } catch (_) { /* 忽略 */ }
+      throw new Error(`GraphQL HTTP ${resp.status}${body ? ' · ' + body : ''}`);
+    }
 
     const json = await resp.json();
     if (json.errors && json.errors.length) {
-      throw new Error(json.errors.map((e) => e.message).join('; '));
+      throw new Error(json.errors.map((e) => e.message).join('; ').slice(0, 300));
     }
     return json.data || {};
+  }
+
+  // 把页面自己发过的 Activities 查询记下来：我方硬编码的查询失效时直接复用
+  function installNetworkSpy() {
+    const w = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
+    if (!w || w.__uberRcSpy) return;
+    try {
+      const origFetch = w.fetch;
+      if (!origFetch) return;
+      w.__uberRcSpy = true;
+      w.fetch = function (input, init) {
+        try {
+          const url = typeof input === 'string' ? input : (input && input.url) || '';
+          const body = init && typeof init.body === 'string' ? init.body : null;
+          if (/graphql/i.test(url) && body) {
+            const j = JSON.parse(body);
+            const q = j && j.query ? String(j.query) : '';
+            if (q && /activities\s*\(/i.test(q) && /past\s*\(/i.test(q)) {
+              learned.activities = { operationName: j.operationName || null, query: q, variables: j.variables || {} };
+              debug('已捕获页面自身的 Activities 查询:', j.operationName);
+            } else if (q && /(invoiceFiles|getReceipt)/i.test(q)) {
+              if (learned.receiptOps.indexOf(q) < 0) {
+                learned.receiptOps.push(q);
+                debug('已捕获页面自身的收据查询:', j.operationName);
+              }
+            }
+          }
+        } catch (_) { /* 非 JSON 或跨域，忽略 */ }
+        return origFetch.apply(this, arguments);
+      };
+    } catch (_) { /* 沙箱不允许 hook，忽略 */ }
   }
 
   async function collectTripsFromApi(startMs, endMs) {
     const trips = [];
     const seen = new Set();
     let token = null;
+    let useLearned = false;
 
     for (let page = 0; page < 500; page++) {
       const variables = {
@@ -467,12 +513,26 @@
       if (endMs) variables.endTimeMs = endMs;
       if (token) variables.nextPageToken = token;
 
-      const data = await gql('Activities', variables);
+      let data;
+      try {
+        data = await gql('Activities', variables, useLearned ? learned.activities : null);
+      } catch (e) {
+        // 第一次失败：如果抓到过页面自身的查询，就换成它再试一次
+        if (!useLearned && learned.activities) {
+          logLine(`接口查询失败（${e.message}），改用页面自身的请求重试…`, 'warn');
+          useLearned = true;
+          page--;
+          await sleep(CFG.reqDelayMs + rand(0, 250));
+          continue;
+        }
+        throw e;
+      }
+
       const past = data.activities && data.activities.past;
       if (!past || !Array.isArray(past.activities)) break;
 
       for (const a of past.activities) {
-        const uuid = extractUuid(a.uuid || a.cardURL);
+        const uuid = extractUuid(a.uuid || a.cardURL || a.jobUuid || '');
         if (!uuid || seen.has(uuid)) continue;
         seen.add(uuid);
         trips.push({
@@ -480,7 +540,7 @@
           title: a.title || '',
           subtitle: a.subtitle || '',
           description: a.description || '',
-          dateMs: null,   // 接口没给时间戳，日期过滤交给服务端
+          dateMs: parseTimeMs(a.timestamp || a.startTime || a.time),
         });
       }
 
@@ -492,6 +552,14 @@
     }
 
     return trips;
+  }
+
+  function parseTimeMs(v) {
+    if (v == null || v === '') return null;
+    const n = Number(v);
+    if (!isNaN(n) && n > 1e11) return n;
+    const ms = Date.parse(v);
+    return isNaN(ms) ? null : ms;
   }
 
   /* =========================================================
@@ -548,27 +616,69 @@
     return null;
   }
 
+  // 从任意元素的属性里抠 UUID（/trips/ 链接、jobId 参数、data-uuid、aria-label…）
+  const CANDIDATE_SEL = 'a[href],[data-uuid],[data-job-id],[data-testid],[id],[aria-label],[data-trip-uuid]';
+  const UUID_ANY_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+  const JOBID_RE = /(?:jobId|job_id|jobUUID|tripUUID|trip_uuid)=([\w-]{10,40})/i;
+
+  function attrBlob(el) {
+    return [
+      el.getAttribute('href'),
+      el.getAttribute('data-uuid'),
+      el.getAttribute('data-job-id'),
+      el.getAttribute('data-trip-uuid'),
+      el.getAttribute('data-testid'),
+      el.getAttribute('id'),
+      el.getAttribute('aria-label'),
+      el.getAttribute('onclick'),
+    ].filter(Boolean).join(' ');
+  }
+
+  function cardRootOf(el) {
+    let n = el;
+    for (let i = 0; i < 8 && n && n !== document.body; i++) {
+      if (n.matches && n.matches('li,article,[role="listitem"],[data-testid*="card" i],[data-testid*="trip" i],[data-testid*="activity" i],[data-testid*="ride" i],[data-testid*="order" i]')) {
+        return n;
+      }
+      n = n.parentElement;
+    }
+    return (el.parentElement && el.parentElement.parentElement) || el.parentElement || el;
+  }
+
   async function collectTripsFromDom(startMs, endMs) {
     const found = new Map();
     let earliest = Infinity;
     let idleRounds = 0;
 
     const grab = () => {
-      const links = document.querySelectorAll('a[href*="/trips/"],a[href*="jobId="]');
-      links.forEach((a) => {
-        const uuid = extractUuid(a.getAttribute('href') || '');
-        if (!uuid || found.has(uuid)) return;
-        const card = a.closest('li') || a.closest('[data-testid]') || a.parentElement;
-        const dateMs = readCardDateMs(a);
+      const els = document.querySelectorAll(CANDIDATE_SEL);
+      for (let i = 0; i < els.length; i++) {
+        const el = els[i];
+        const blob = attrBlob(el);
+        if (!blob) continue;
+
+        let uuid = null;
+        const mJob = blob.match(JOBID_RE);
+        if (mJob) {
+          uuid = mJob[1];
+        } else {
+          const mUuid = blob.match(UUID_ANY_RE);
+          if (mUuid) uuid = mUuid[0];
+        }
+        if (!uuid || found.has(uuid)) continue;
+
+        const card = cardRootOf(el);
+        const dateMs = readCardDateMs(el);
         if (dateMs) earliest = Math.min(earliest, dateMs);
+        const cardText = card && card.innerText ? card.innerText.replace(/\s+/g, ' ').trim() : '';
         found.set(uuid, {
           uuid,
-          title: (a.innerText || '').trim() || (card && card.innerText ? card.innerText.split('\n')[0] : ''),
+          title: (el.innerText || '').trim().split('\n')[0] || cardText.slice(0, 40),
           subtitle: '',
-          description: card && card.innerText ? card.innerText.replace(/\s+/g, ' ').slice(0, 120) : '',
+          description: cardText.slice(0, 120),
           dateMs,
         });
-      });
+      }
     };
 
     for (let round = 0; round < 80; round++) {
@@ -591,7 +701,7 @@
 
       // 已经加载到比开始日期更早的行程了 → 没必要继续滚
       if (startMs && earliest < startMs - 3 * 86400000) break;
-      if (idleRounds >= 4) break;
+      if (idleRounds >= 6) break;
       if (state.stopRequested) break;
     }
 
@@ -711,8 +821,13 @@
 
     const trigger = pickReceiptTrigger(card);
     if (!trigger) {
-      debug('卡片上找不到收据入口', trip.uuid);
-      return null;
+      // 小卡片上通常没有收据入口（只有 Help 链接），用已知 uuid 直接构造收据端点；
+      // 不带 timestamp 时 Uber 会返回最新一份；若返回的是 HTML，fetchPdfBlob 会校验后判失败。
+      debug('卡片上找不到收据入口，改用构造地址', trip.uuid);
+      return {
+        kind: 'receipt-constructed',
+        url: `${location.origin}/trips/${trip.uuid}/receipt?contentType=PDF`,
+      };
     }
 
     // 入口本身是链接时不要点击：一点就把整个 SPA 跳走了，脚本状态全丢。
@@ -741,6 +856,13 @@
     }
 
     await closeAnyModal();
+
+    if (!result) {
+      result = {
+        kind: 'receipt-constructed',
+        url: `${location.origin}/trips/${trip.uuid}/receipt?contentType=PDF`,
+      };
+    }
     return result;
   }
 
@@ -1154,6 +1276,7 @@
   function boot() {
     const host = document.body || document.documentElement;
     if (!host) return;
+    installNetworkSpy();
     if (!isTripsPage()) {
       if (state.running) return;   // 下载过程中不要拆面板
       if (ui.panel && ui.panel.parentElement) ui.panel.remove();
@@ -1162,7 +1285,7 @@
     }
     if (document.getElementById(PANEL_ID)) return;
     try {
-      if (mountPanel()) console.info('[UberRC] 面板已注入 v1.0.4');
+      if (mountPanel()) console.info('[UberRC] 面板已注入 v1.1.0');
     } catch (e) {
       console.error('[UberRC] 面板注入失败', e);
     }
@@ -1171,9 +1294,10 @@
   // 自检入口：TM 菜单 →「检查脚本是否运行」不通时，可在控制台输入 __uberRC.diag()
   function exposeDebugApi() {
     const api = {
-      version: '1.0.4',
+      version: '1.1.0',
       diag() {
         return {
+          version: '1.1.0',
           url: location.href,
           pathname: location.pathname,
           isTripsPage: isTripsPage(),
@@ -1181,6 +1305,11 @@
           bodyReady: !!document.body,
           running: state.running,
           resultCount: state.results.length,
+          learnedActivities: learned.activities
+            ? { operationName: learned.activities.operationName, varKeys: Object.keys(learned.activities.variables || {}) }
+            : null,
+          learnedReceiptQueries: learned.receiptOps.length,
+          candidatesInDom: document.querySelectorAll(CANDIDATE_SEL).length,
           config: CFG,
         };
       },
