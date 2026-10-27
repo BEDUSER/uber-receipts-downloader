@@ -53,7 +53,7 @@ try {
     $tmp = Join-Path $env:TEMP "uber_rc_publish_msg.txt"
     [System.IO.File]::WriteAllText($tmp, $msg, (New-Object System.Text.UTF8Encoding($false)))
     Invoke-Git @("commit", "-F", $tmp) | Out-Null
-    $pushCode = Invoke-Git (@("push") + $tlsArgs)
+    $pushCode = Invoke-Git ($tlsArgs + @("push"))
     if ($pushCode -ne 0) { throw "git push 失败（exit $pushCode）" }
   }
   Write-Host ""
