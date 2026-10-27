@@ -40,8 +40,8 @@ try {
     $msg = "$Message`n`nCo-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
     $tmp = Join-Path $env:TEMP "uber_rc_publish_msg.txt"
     [System.IO.File]::WriteAllText($tmp, $msg, (New-Object System.Text.UTF8Encoding($false)))
-    git commit -F $tmp | Out-Host
-    git push | Out-Host
+    git commit -F $tmp 2>&1 | Out-String | Write-Host
+    git push 2>&1 | Out-String | Write-Host
   }
 
   $h = @{
